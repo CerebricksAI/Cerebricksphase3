@@ -44,43 +44,128 @@ CORS_HEADERS = {
 # DOCUMENT PARSER - Multi-format support
 # ============================================================================
 
+# Check for optional dependencies
+try:
+    import PyPDF2
+    HAS_PYPDF2 = True
+except ImportError:
+    HAS_PYPDF2 = False
+
+try:
+    from docx import Document as DocxDocument
+    HAS_DOCX = True
+except ImportError:
+    HAS_DOCX = False
+
+
 def parse_document(file_path: str, filename: str) -> str:
-    """Parse document to plain text based on file extension"""
+    """Parse document to plain text based on file extension.
+
+    Supports: .txt, .md, .markdown, .rst, .json, .xml, .html, .csv, .pdf, .docx
+    """
     ext = Path(filename).suffix.lower()
-    
-    if ext in ['.txt', '.md']:
+
+    # Text-based formats
+    if ext in ['.txt', '.md', '.markdown', '.rst', '.json', '.xml', '.html', '.htm', '.csv']:
         return parse_text(file_path)
+    # PDF
     elif ext == '.pdf':
         return parse_pdf(file_path)
+    # Word documents
     elif ext == '.docx':
         return parse_docx(file_path)
     else:
-        raise ValueError(f"Unsupported file format: {ext}")
+        # Try to detect format from file content
+        return parse_unknown(file_path, ext)
 
 
 def parse_text(file_path: str) -> str:
-    """Parse plain text files"""
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return f.read()
+    """Parse plain text files with encoding fallback"""
+    encodings = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+
+    raise ValueError(f"Could not decode text file with any supported encoding")
 
 
 def parse_pdf(file_path: str) -> str:
     """Parse PDF files using PyPDF2"""
-    import PyPDF2
-    text = []
+    if not HAS_PYPDF2:
+        raise ImportError("PDF support requires PyPDF2. Install with: pip install PyPDF2")
+
+    text_parts = []
     with open(file_path, 'rb') as f:
         pdf_reader = PyPDF2.PdfReader(f)
-        for page in pdf_reader.pages:
-            text.append(page.extract_text())
-    return '\n\n'.join(text)
+        num_pages = len(pdf_reader.pages)
+        logger.info(f"   📄 PDF has {num_pages} pages")
+
+        for page_num, page in enumerate(pdf_reader.pages, 1):
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(f"--- Page {page_num} ---\n{page_text}")
+
+    content = '\n\n'.join(text_parts)
+
+    if not content.strip():
+        raise ValueError("PDF appears to be empty or contains only images (no extractable text)")
+
+    return content
 
 
 def parse_docx(file_path: str) -> str:
     """Parse DOCX files using python-docx"""
-    from docx import Document
-    doc = Document(file_path)
-    text = [p.text for p in doc.paragraphs]
-    return '\n\n'.join(text)
+    if not HAS_DOCX:
+        raise ImportError("DOCX support requires python-docx. Install with: pip install python-docx")
+
+    doc = DocxDocument(file_path)
+    text_parts = []
+
+    # Extract paragraphs
+    for para in doc.paragraphs:
+        if para.text.strip():
+            text_parts.append(para.text)
+
+    # Extract tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = ' | '.join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                text_parts.append(row_text)
+
+    content = '\n\n'.join(text_parts)
+
+    if not content.strip():
+        raise ValueError("DOCX appears to be empty")
+
+    return content
+
+
+def parse_unknown(file_path: str, ext: str) -> str:
+    """Attempt to parse unknown file format"""
+    # Try as text first
+    try:
+        return parse_text(file_path)
+    except:
+        pass
+
+    # Check magic bytes
+    with open(file_path, 'rb') as f:
+        header = f.read(8)
+
+    if header.startswith(b'%PDF'):
+        return parse_pdf(file_path)
+    elif header.startswith(b'PK'):  # ZIP-based (docx, xlsx, etc.)
+        try:
+            return parse_docx(file_path)
+        except:
+            pass
+
+    raise ValueError(f"Unsupported file format: {ext}\nSupported: .txt, .md, .pdf, .docx")
 
 
 # ============================================================================
@@ -435,29 +520,30 @@ class KnowledgeCaptureOrchestrator:
             raise
     
     def _upload_documents(self, document_paths: List[str], enterprise_name: Optional[str]) -> List[DocumentContext]:
-        """PHASE 1: Upload"""
+        """PHASE 1: Upload - Supports multiple file formats (txt, md, pdf, docx)"""
         documents = []
-        
+
         for i, path in enumerate(document_paths, 1):
             try:
                 filename = os.path.basename(path)
-                logger.info(f"📄 [{i}/{len(document_paths)}] {filename}")
-                
-                with open(path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
+                file_ext = Path(path).suffix.lower()
+                logger.info(f"📄 [{i}/{len(document_paths)}] {filename} ({file_ext})")
+
+                # Use the multi-format document parser
+                content = parse_document(path, filename)
+
                 doc = DocumentContext(
                     filename=filename,
-                    file_type=Path(path).suffix.lower(),
+                    file_type=file_ext,
                     content=content,
                     enterprise=enterprise_name
                 )
                 documents.append(doc)
-                logger.info(f"   ✅ Uploaded")
-                
+                logger.info(f"   ✅ Uploaded ({len(content)} chars extracted)")
+
             except Exception as e:
                 logger.error(f"   ❌ Failed: {e}")
-        
+
         return documents
     
     def _extract_knowledge(self, documents: List[DocumentContext]) -> List[ExtractedKnowledge]:
@@ -1375,7 +1461,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)
-        
+
         return {
             'statusCode': 500,
             'headers': CORS_HEADERS,
@@ -1384,3 +1470,124 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'type': type(e).__name__
             })
         }
+
+
+# ============================================================================
+# LOCAL EXECUTION MODE - For testing without AWS Lambda
+# ============================================================================
+
+class LocalAnthropicClient:
+    """Local client using Anthropic API directly (not Bedrock)"""
+
+    def __init__(self, api_key: str = None):
+        try:
+            import anthropic
+            self.api_key = api_key or os.environ.get('ANTHROPIC_API_KEY')
+            if not self.api_key:
+                raise ValueError("ANTHROPIC_API_KEY not set")
+            self.client = anthropic.Anthropic(api_key=self.api_key)
+            self.model = "claude-sonnet-4-20250514"
+            logger.info("✅ Anthropic client initialized (local mode)")
+        except ImportError:
+            raise ImportError("Local mode requires 'anthropic' package. Install with: pip install anthropic")
+
+    def invoke(self, prompt: str, max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS) -> str:
+        """Invoke Claude API directly"""
+        if len(prompt) > MAX_INPUT_CHARS:
+            logger.warning(f"⚠️  Truncating prompt from {len(prompt)} chars")
+            prompt = prompt[:MAX_INPUT_CHARS] + "\n\n[TRUNCATED]"
+
+        message = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return message.content[0].text
+
+
+class LocalKnowledgeOrchestrator(KnowledgeCaptureOrchestrator):
+    """Local orchestrator that uses Anthropic API instead of Bedrock"""
+
+    def __init__(self, api_key: str = None):
+        logger.info("="*70)
+        logger.info("🚀 LOCAL SKILL GENERATOR (Anthropic API)")
+        logger.info("="*70)
+        self.client = LocalAnthropicClient(api_key=api_key)
+        self.model = self.client.model
+        logger.info(f"✅ Ready (Model: {self.model})")
+        logger.info("")
+
+
+def main():
+    """Local execution entry point"""
+    import sys
+
+    print("="*70)
+    print("🏠 LOCAL KNOWLEDGE EXTRACTION")
+    print("="*70)
+    print("")
+
+    if len(sys.argv) < 2:
+        print("Usage: python lambda_handler.py <document_file> [enterprise_name]")
+        print("")
+        print("Supported formats: .txt, .md, .pdf, .docx")
+        print("")
+        print("Examples:")
+        print("  python lambda_handler.py manual.pdf")
+        print("  python lambda_handler.py \"Retail SOP.pdf\" RetailCo")
+        print("")
+        print("Environment variables:")
+        print("  ANTHROPIC_API_KEY - Required for local execution")
+        return 1
+
+    input_file = sys.argv[1]
+    enterprise_name = sys.argv[2] if len(sys.argv) > 2 else None
+
+    # Check file exists
+    if not os.path.exists(input_file):
+        print(f"❌ Error: File not found: {input_file}")
+        return 1
+
+    # Check API key
+    if not os.environ.get('ANTHROPIC_API_KEY'):
+        print("❌ Error: ANTHROPIC_API_KEY environment variable not set")
+        print("")
+        print("Set it with:")
+        print("  set ANTHROPIC_API_KEY=your-api-key-here  (Windows)")
+        print("  export ANTHROPIC_API_KEY=your-api-key-here  (Linux/Mac)")
+        return 1
+
+    try:
+        # Create output directory
+        output_dir = "./extracted_skills"
+
+        # Initialize local orchestrator
+        orchestrator = LocalKnowledgeOrchestrator()
+
+        # Process document
+        result = orchestrator.process_documents(
+            document_paths=[input_file],
+            enterprise_name=enterprise_name,
+            output_dir=output_dir
+        )
+
+        print("")
+        print("="*70)
+        print("✅ EXTRACTION COMPLETE!")
+        print("="*70)
+        print(f"📁 Output directory: {output_dir}")
+        print(f"📊 Skills generated: {result.get('skills_generated', 0)}")
+        print("")
+
+        return 0
+
+    except Exception as e:
+        print(f"\n❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    exit(main())
