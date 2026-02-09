@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Knowledge Extraction Skills API
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 3008
+    Runtime: python3.10
+    Environment:
+      Variables:
+        SKILLS_BUCKET: !Ref SkillsBucket
+
+Resources:
+  # S3 Bucket for storing generated skills
+  SkillsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'knowledge-extraction-skills-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Lambda Function
+  KnowledgeExtractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: knowledge_extraction_skills
+      CodeUri: ./
+      Handler: lambda_handler.handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref SkillsBucket
+        - Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:knowledge_extraction_skills'
+      Events:
+        ExtractSkills:
+          Type: Api
+          Properties:
+            Path: /extract
+            Method: POST
+            RestApiId: !Ref KnowledgeExtractionApi
+        CheckStatus:
+          Type: Api
+          Properties:
+            Path: /status/{job_id}
+            Method: GET
+            RestApiId: !Ref KnowledgeExtractionApi
+
+  # API Gateway
+  KnowledgeExtractionApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: knowledge-extraction-api
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowHeaders: "'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+        MaxAge: "'600'"
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${KnowledgeExtractionApi}.execute-api.${AWS::Region}.amazonaws.com/prod/extract"
+  
+  SkillsBucket:
+    Description: "S3 bucket for skills"
+    Value: !Ref SkillsBucket
+  
+  FunctionName:
+    Description: "Lambda function name"
+    Value: !Ref KnowledgeExtractionFunction
