@@ -34,19 +34,272 @@ def get_s3_client():
         _s3_client = boto3.client('s3')
     return _s3_client
 
+
+# S3 Upload prefix for direct file uploads (before processing)
+UPLOADS_PREFIX = "pending_uploads/"
+
+
+def generate_presigned_upload_url(filename: str, enterprise_name: str = None, user_id: str = None, expiration: int = 3600):
+    """
+    Generate a presigned URL for direct S3 upload.
+
+    This allows the UI to upload files directly to S3, bypassing API Gateway
+    and Lambda payload limits. Much more efficient for large files.
+
+    Args:
+        filename: Original filename (e.g., "RetailCo_Manual.pdf")
+        enterprise_name: Optional enterprise name for organization
+        user_id: Optional user ID for folder organization (takes priority over enterprise_name)
+        expiration: URL expiration time in seconds (default 1 hour)
+
+    Returns:
+        dict with upload_url, s3_key, and expiration info
+    """
+    import uuid
+
+    # Generate unique key to avoid conflicts
+    unique_id = str(uuid.uuid4())[:8]
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    # Sanitize filename for S3
+    safe_filename = sanitize_for_s3_key(Path(filename).stem)
+    extension = Path(filename).suffix.lower()
+
+    # Build S3 key: pending_uploads/{user_id or enterprise}/{timestamp}_{unique}_{filename}
+    # Priority: user_id > enterprise_name
+    folder_name = None
+    if user_id:
+        folder_name = sanitize_for_s3_key(user_id)
+    elif enterprise_name:
+        folder_name = sanitize_for_s3_key(enterprise_name)
+
+    if folder_name:
+        s3_key = f"{UPLOADS_PREFIX}{folder_name}/{timestamp}_{unique_id}_{safe_filename}{extension}"
+    else:
+        s3_key = f"{UPLOADS_PREFIX}{timestamp}_{unique_id}_{safe_filename}{extension}"
+
+    # Generate presigned URL for PUT operation
+    presigned_url = get_s3_client().generate_presigned_url(
+        'put_object',
+        Params={
+            'Bucket': SKILLS_BUCKET,
+            'Key': s3_key,
+            'ContentType': 'application/octet-stream'
+        },
+        ExpiresIn=expiration
+    )
+
+    logger.info(f"[PRESIGNED_URL] Generated upload URL for: {s3_key}")
+
+    return {
+        'upload_url': presigned_url,
+        's3_key': s3_key,
+        'bucket': SKILLS_BUCKET,
+        'expires_in_seconds': expiration,
+        'filename': filename,
+        'user_id': user_id,
+        'enterprise_name': enterprise_name
+    }
+
+
+def read_file_from_s3(s3_key: str) -> bytes:
+    """
+    Read file content from S3.
+
+    Args:
+        s3_key: The S3 key where the file was uploaded
+
+    Returns:
+        File content as bytes
+    """
+    logger.info(f"[S3_READ] Reading file from: s3://{SKILLS_BUCKET}/{s3_key}")
+
+    response = get_s3_client().get_object(
+        Bucket=SKILLS_BUCKET,
+        Key=s3_key
+    )
+
+    file_content = response['Body'].read()
+    logger.info(f"[S3_READ] Read {len(file_content)} bytes from S3")
+
+    return file_content
+
+
+def delete_uploaded_file(s3_key: str):
+    """
+    Delete the uploaded file from S3 after processing.
+
+    Args:
+        s3_key: The S3 key of the uploaded file
+    """
+    try:
+        get_s3_client().delete_object(
+            Bucket=SKILLS_BUCKET,
+            Key=s3_key
+        )
+        logger.info(f"[S3_CLEANUP] Deleted uploaded file: {s3_key}")
+    except Exception as e:
+        logger.warning(f"[S3_CLEANUP] Failed to delete {s3_key}: {e}")
+
+
 # Model configuration
 BEDROCK_MODEL = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 MAX_TOKENS = 200000
 DEFAULT_MAX_OUTPUT_TOKENS = 16000
 MAX_INPUT_CHARS = 300000
 
-# CORS headers for all responses
+# CORS headers for all responses - Enhanced for UI compatibility
 CORS_HEADERS = {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token'
+    'Access-Control-Allow-Methods': 'POST, GET, PUT, DELETE, PATCH, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Amz-Date, Authorization, X-Api-Key, X-Amz-Security-Token, X-Requested-With, Accept, Origin, Cache-Control',
+    'Access-Control-Expose-Headers': 'Content-Length, X-Request-Id, X-Amz-Request-Id',
+    'Access-Control-Max-Age': '86400'  # Cache preflight for 24 hours
 }
+
+
+# ============================================================================
+# ENTERPRISE NAME UTILITIES - For S3 skill folder naming
+# ============================================================================
+
+def sanitize_for_s3_key(name: str) -> str:
+    """
+    Sanitize a name for use as S3 key component.
+    - Converts to lowercase
+    - Replaces spaces and special chars with hyphens
+    - Removes consecutive hyphens
+    - Removes leading/trailing hyphens
+    """
+    if not name:
+        return ""
+
+    # Convert to lowercase
+    sanitized = name.lower().strip()
+
+    # Replace common separators and special chars with hyphens
+    sanitized = re.sub(r'[\s_\.,;:!@#$%^&*()+=\[\]{}|\\<>?/\'\"]+', '-', sanitized)
+
+    # Remove any remaining non-alphanumeric chars except hyphens
+    sanitized = re.sub(r'[^a-z0-9\-]', '', sanitized)
+
+    # Remove consecutive hyphens
+    sanitized = re.sub(r'-+', '-', sanitized)
+
+    # Remove leading/trailing hyphens
+    sanitized = sanitized.strip('-')
+
+    return sanitized
+
+
+def extract_enterprise_from_filename(filename: str) -> str:
+    """
+    Try to extract enterprise/company name from filename.
+    Examples:
+    - "RetailCo_Policy_Manual.pdf" -> "retailco"
+    - "Acme Corp - Employee Handbook.docx" -> "acme-corp"
+    - "company_procedures.txt" -> "company"
+    """
+    if not filename:
+        return ""
+
+    # Remove extension
+    name_without_ext = Path(filename).stem
+
+    # Split by common separators and take the first meaningful part
+    parts = re.split(r'[\s_\-\.]+', name_without_ext)
+
+    # Filter out common non-enterprise words (these should not be used as enterprise names)
+    skip_words = {
+        # Document types
+        'policy', 'manual', 'handbook', 'guide', 'procedure', 'procedures',
+        'document', 'doc', 'file', 'draft', 'final', 'v1', 'v2', 'version',
+        # Generic terms
+        'employee', 'company', 'corporate', 'internal', 'external',
+        # Job/task related (not enterprise identifiers)
+        'job', 'task', 'work', 'project', 'assignment',
+        # Test/sample related
+        'test', 'sample', 'example', 'demo', 'trial', 'temp', 'tmp',
+        # Common prefixes
+        'new', 'old', 'updated', 'revised', 'current', 'latest',
+        # Generic document names
+        'sop', 'readme', 'notes', 'instructions', 'rules', 'guidelines'
+    }
+
+    enterprise_parts = []
+    for part in parts:
+        part_lower = part.lower()
+        if part_lower and part_lower not in skip_words and len(part_lower) > 1:
+            enterprise_parts.append(part)
+            # Take first 2 meaningful parts max
+            if len(enterprise_parts) >= 2:
+                break
+
+    if enterprise_parts:
+        return sanitize_for_s3_key('-'.join(enterprise_parts))
+
+    # Fallback: try first part of filename if it's meaningful (not a skip word)
+    if parts:
+        first_part = parts[0].lower()
+        # Only use first part if it's not a generic skip word and has meaningful length
+        if first_part not in skip_words and len(first_part) > 2:
+            return sanitize_for_s3_key(parts[0])
+
+    # Final fallback - return empty to let caller decide
+    return ""
+
+
+def generate_skill_folder_name(enterprise_name: Optional[str], filename: str, user_id: Optional[str] = None) -> str:
+    """
+    Generate a skill folder name for S3 storage.
+
+    Priority:
+    1. Use provided user_id (sanitized) - e.g., "akhilparelly"
+    2. Use provided enterprise_name (sanitized)
+    3. Extract from filename
+    4. Fallback to 'enterprise-skill'
+
+    Uses a single folder per user/enterprise to consolidate all extractions.
+
+    Returns: e.g., "akhilparelly" or "retailco" or "acme-corp"
+    """
+    base_name = None
+    source = None
+
+    # Priority 1: Use provided user_id
+    if user_id:
+        base_name = sanitize_for_s3_key(user_id)
+        if base_name:
+            source = "user_id"
+            logger.info(f"[SKILL_FOLDER] Using provided user_id: '{user_id}' -> '{base_name}'")
+
+    # Priority 2: Use provided enterprise_name
+    if not base_name and enterprise_name:
+        base_name = sanitize_for_s3_key(enterprise_name)
+        if base_name:
+            source = "provided"
+            logger.info(f"[SKILL_FOLDER] Using provided enterprise name: '{enterprise_name}' -> '{base_name}'")
+
+    # Priority 2: Extract from filename
+    if not base_name:
+        base_name = extract_enterprise_from_filename(filename)
+        if base_name:
+            source = "filename"
+            logger.info(f"[SKILL_FOLDER] Extracted from filename '{filename}' -> '{base_name}'")
+
+    # Priority 3: Fallback
+    if not base_name:
+        base_name = "enterprise-skill"
+        source = "fallback"
+        logger.warning(f"[SKILL_FOLDER] Could not extract enterprise name from filename '{filename}'. "
+                      f"Using fallback: '{base_name}'. Consider providing 'enterprise_name' in request.")
+
+    # Use single folder per enterprise (no timestamp for uniqueness)
+    # This allows all extractions for the same enterprise to be stored in one folder
+    folder_name = base_name
+
+    logger.info(f"[SKILL_FOLDER] Generated: '{folder_name}' (source: {source}) - using single folder per enterprise")
+    return folder_name
 
 # ============================================================================
 # DOCUMENT PARSER - Multi-format support
@@ -249,14 +502,23 @@ def parse_multipart_form_data(body: str, content_type: str) -> Dict[str, Any]:
             
             # Clean up content (remove trailing boundary markers)
             content = content.rstrip(b'\r\n')
-            
+
+            # Log each field found for debugging
+            logger.info(f"[MULTIPART] Found field: '{field_name}'" + (f" (filename: '{filename}')" if filename else ""))
+
             if field_name == 'file':
                 result['file'] = content
                 if filename:
                     result['filename'] = filename
-            elif field_name == 'enterprise_name':
-                result['enterprise_name'] = content.decode('utf-8').strip()
-    
+            # Support multiple variations of enterprise_name field
+            elif field_name in ('enterprise_name', 'enterpriseName', 'enterprise-name', 'EnterpriseName'):
+                enterprise_value = content.decode('utf-8').strip()
+                result['enterprise_name'] = enterprise_value
+                logger.info(f"[MULTIPART] Extracted enterprise_name: '{enterprise_value}' from field '{field_name}'")
+
+    # Log final parsed result (without file content)
+    logger.info(f"[MULTIPART] Parsed result: filename='{result.get('filename')}', enterprise_name='{result.get('enterprise_name')}'")
+
     return result
 
 
@@ -854,15 +1116,18 @@ Extract 15-25 items. Be COMPREHENSIVE on rules."""
         definitions_yaml = self._generate_definitions_yaml(definitions)
         examples_yaml = self._generate_production_examples_yaml(knowledge, intention, procedures)
 
-        # Generate configuration file for customization
-        config_yaml = self._generate_config_yaml(intention, decision_rules, inferred_domain, enterprise_name)
+        # Generate configuration schema file for customization
+        config_schema_json = self._generate_config_schema_json(intention, decision_rules, inferred_domain, enterprise_name, knowledge)
 
         # Generate Python script
         script_py = self._generate_script_for_skill(intention, knowledge, inferred_domain)
 
+        # Generate detailed 2-3 line description for metadata
+        skill_description = self._generate_skill_description(intention, procedures, decision_rules, inferred_domain)
+
         metadata = SkillMetadata(
             name=intention,
-            description=f"Production skill: {intention}",
+            description=skill_description,
             version="1.0.0",
             source_documents=list(set(k.source_document for k in knowledge)),
             confidence=sum(k.confidence for k in knowledge) / len(knowledge) if knowledge else 0.5,
@@ -878,10 +1143,134 @@ Extract 15-25 items. Be COMPREHENSIVE on rules."""
             "rules_yaml": rules_yaml,
             "definitions_yaml": definitions_yaml,
             "examples_yaml": examples_yaml,
-            "config_yaml": config_yaml,
+            "config_schema_json": config_schema_json,
             "script_py": script_py
         }
     
+    def _generate_skill_description(
+        self,
+        intention: str,
+        procedures: List[ExtractedKnowledge],
+        decision_rules: List[ExtractedKnowledge],
+        domain: str
+    ) -> str:
+        """Generate a meaningful 3-4 line description using Claude API.
+
+        ALWAYS uses Claude API to understand the skill by its TITLE and generate
+        a meaningful description that helps agents understand when to use this skill.
+        """
+        skill_name_readable = intention.replace('-', ' ').replace('_', ' ')
+
+        # Collect any available context from procedures and rules
+        procedure_context = ""
+        rule_context = ""
+
+        if procedures:
+            proc_texts = [p.content.strip()[:300] for p in procedures[:3] if p.content]
+            if proc_texts:
+                procedure_context = "Available procedure details: " + " | ".join(proc_texts)
+
+        if decision_rules:
+            rule_texts = [r.content.strip()[:200] for r in decision_rules[:3] if r.content]
+            if rule_texts:
+                rule_context = "Business rules: " + " | ".join(rule_texts)
+
+        # Simple, focused prompt that works with just the skill name
+        prompt = f"""Generate a meaningful skill description (exactly 3 sentences) for an AI agent system.
+
+SKILL NAME: "{skill_name_readable}"
+DOMAIN: {domain}
+{procedure_context}
+{rule_context}
+
+Write exactly 3 sentences:
+SENTENCE 1: What does this skill do? Start with an action verb. Be specific about the task.
+SENTENCE 2: What key actions or steps does it involve? List 2-4 specific procedures.
+SENTENCE 3: When should an agent use this skill? What user requests would trigger it?
+
+RULES:
+- Understand the skill from its NAME - "{skill_name_readable}" tells you what it does
+- Use SPECIFIC action verbs (guides, executes, verifies, processes, handles)
+- NEVER say "manages", "outlines", "provides guidance", "ensures compliance"
+- Include concrete examples relevant to the skill name
+- Each sentence should be 15-25 words
+
+EXAMPLES:
+For "close-store-safely":
+"Walks retail employees through the complete end-of-day store shutdown process step by step. Covers cash register closing, inventory securing, alarm activation, and facility lockup procedures. Use when staff need guidance on proper closing duties or ask about end-of-day tasks."
+
+For "process-refund":
+"Handles customer refund requests from initial verification through payment reversal completion. Includes receipt validation, item condition check, refund method selection, and transaction recording. Activate when customers request returns, exchanges, or money back for purchases."
+
+Now write for "{skill_name_readable}":"""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            description = response.content[0].text.strip()
+
+            # Clean up
+            description = description.replace('"', '').strip()
+
+            # Remove common prefixes
+            prefixes_to_remove = ['description:', 'here is', 'here\'s', 'for "', f'for "{skill_name_readable}":', 'output:']
+            desc_lower = description.lower()
+            for prefix in prefixes_to_remove:
+                if desc_lower.startswith(prefix):
+                    description = description[len(prefix):].strip()
+
+            # Ensure we have meaningful content (at least 100 chars = ~3 sentences)
+            if description and len(description) >= 100:
+                logger.info(f"[SKILL_DESC] Generated description ({len(description)} chars) for {intention}")
+                return description[:600]
+
+            logger.warning(f"[SKILL_DESC] Response too short ({len(description)} chars), regenerating")
+
+        except Exception as e:
+            logger.error(f"[SKILL_DESC] Claude API error for {intention}: {e}")
+
+        # Fallback: Generate based on skill name understanding
+        # Parse skill name to understand intent
+        skill_words = skill_name_readable.lower().split()
+
+        # Common skill action patterns
+        action_map = {
+            'close': ('shutting down', 'closing procedures, security checks, and final verification'),
+            'open': ('starting up', 'opening procedures, system checks, and preparation tasks'),
+            'process': ('handling', 'validation, processing steps, and completion verification'),
+            'complete': ('finishing', 'required steps, verification checks, and sign-off procedures'),
+            'verify': ('validating', 'inspection points, compliance checks, and documentation'),
+            'prepare': ('getting ready for', 'setup tasks, resource gathering, and preparation checklist'),
+            'check': ('inspecting', 'verification points, status reviews, and compliance validation'),
+            'handle': ('managing', 'intake procedures, processing steps, and resolution actions'),
+            'submit': ('sending', 'data collection, validation, and submission confirmation'),
+            'review': ('examining', 'analysis steps, evaluation criteria, and approval workflow'),
+            'update': ('modifying', 'change identification, update procedures, and verification'),
+            'create': ('building', 'creation steps, required inputs, and output validation'),
+            'security': ('securing', 'security protocols, access controls, and safety measures'),
+            'safety': ('ensuring safety through', 'safety checks, hazard identification, and protective measures')
+        }
+
+        # Find matching action
+        action_verb = 'executing'
+        action_details = 'required steps, verification checks, and completion procedures'
+
+        for word in skill_words:
+            if word in action_map:
+                action_verb, action_details = action_map[word]
+                break
+
+        # Build meaningful fallback
+        line1 = f"Guides {domain} staff through {action_verb} {skill_name_readable} tasks from start to finish."
+        line2 = f"Covers {action_details} specific to {skill_name_readable}."
+        line3 = f"Activate when users ask about {skill_name_readable.lower()} or need step-by-step help with related tasks."
+
+        return f"{line1} {line2} {line3}"
+
     def _generate_production_skill_md(
         self,
         intention: str,
@@ -891,25 +1280,28 @@ Extract 15-25 items. Be COMPREHENSIVE on rules."""
         all_knowledge: List[ExtractedKnowledge]
     ) -> str:
         """Generate SKILL.md with production quality"""
-        
+
         # Generate NATURAL LANGUAGE triggers
         triggers = self._generate_natural_triggers(intention, all_knowledge)
-        description = f"Production skill: {intention.replace('-', ' ')}"
-        
+
+        # Generate detailed 2-3 line description
+        description = self._generate_skill_description(intention, procedures, decision_rules, domain)
+
         frontmatter = f"""---
 name: {intention}
-description: {description}
+description: >
+  {description}
 version: 1.0.0
 triggers:
 """
         for trigger in triggers[:7]:
             frontmatter += f'  - pattern: "{trigger}"\n'
         frontmatter += "---\n"
-        
+
         md = frontmatter
-        
+
         md += "\n## Overview\n\n"
-        md += f"Enables {intention.replace('-', ' ')} in {domain}.\n\n"
+        md += f"{description}\n\n"
         
         md += "## When to Use\n\n"
         md += "Activate when customer expresses:\n"
@@ -983,24 +1375,29 @@ triggers:
         md += f"```\n\n"
 
         md += "## Configuration\n\n"
-        md += "This skill can be customized via `config.yaml`. Key settings include:\n\n"
-        md += "```yaml\n"
-        md += "# Business Rules\n"
-        md += "business_rules:\n"
-        md += "  approval_required: false\n"
-        md += "  approval_threshold: 1000\n"
-        md += "  enable_notifications: true\n"
-        md += "\n"
-        md += "# Feature Flags\n"
-        md += "feature_flags:\n"
-        md += "  enable_audit_logging: true\n"
-        md += "  enable_dry_run_mode: false\n"
+        md += "This skill can be customized via `config_schema.json`. Key sections:\n\n"
+        md += "```json\n"
+        md += "{\n"
+        md += "  \"workflow_trigger\": {\n"
+        md += "    \"trigger_type\": \"manual | scheduled | event\",\n"
+        md += "    \"schedule\": { \"frequency\": \"daily\", \"timezone\": \"UTC\" }\n"
+        md += "  },\n"
+        md += "  \"business_thresholds\": {\n"
+        md += "    \"approval_required\": false,\n"
+        md += "    \"approval_threshold\": 1000,\n"
+        md += "    \"escalation_enabled\": true\n"
+        md += "  },\n"
+        md += "  \"output_delivery\": {\n"
+        md += "    \"notification_enabled\": true,\n"
+        md += "    \"notification_channels\": [\"email\"]\n"
+        md += "  }\n"
+        md += "}\n"
         md += "```\n\n"
-        md += "Edit `config.yaml` to customize thresholds, integrations, and notifications for your business.\n\n"
+        md += "Edit `config_schema.json` to customize workflow triggers, thresholds, and notifications.\n\n"
 
         md += "## Additional Resources\n\n"
         md += f"- scripts/{script_name} - Main execution script\n"
-        md += "- config.yaml - **Customizable settings for your business**\n"
+        md += "- config_schema.json - **Customizable settings for your business**\n"
         md += "- metadata.json - Skill metadata and configuration\n"
         md += "- rules.yaml - Business rules and constraints\n"
         md += "- definitions.yaml - Term definitions and glossary\n"
@@ -1226,178 +1623,170 @@ Return 5-7 triggers, one per line, starting with "TRIGGER:"
         
         return yaml.dump(examples_dict, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
-    def _generate_config_yaml(
+    def _generate_config_schema_json(
         self,
         intention: str,
         decision_rules: List[ExtractedKnowledge],
         domain: str,
-        enterprise_name: Optional[str]
+        enterprise_name: Optional[str],
+        knowledge: List[ExtractedKnowledge] = None
     ) -> str:
-        """Generate config.yaml for skill customization.
+        """Generate config_schema.json dynamically using Claude API.
 
-        This configuration file allows users to customize skill behavior
-        for their specific business requirements.
+        Analyzes the skill intention and extracted knowledge to generate
+        truly relevant configuration properties specific to this skill.
         """
 
-        # Extract configurable parameters from rules
-        thresholds = []
-        limits = []
+        # Collect all extracted content for context
+        rules_content = []
+        procedures_content = []
+        exceptions_content = []
 
-        for rule in decision_rules:
-            content = rule.content.lower()
-            # Look for numeric values that could be configurable
-            import re
-            numbers = re.findall(r'\b(\d+)\s*(days?|hours?|minutes?|items?|percent|%|dollars?|\$|units?)\b', content, re.IGNORECASE)
-            for num, unit in numbers:
-                param_name = f"{unit.rstrip('s')}_threshold"
-                thresholds.append({
-                    "name": param_name,
-                    "value": int(num),
-                    "unit": unit,
-                    "source_rule": rule.content[:100]
-                })
+        if decision_rules:
+            for rule in decision_rules:
+                if rule.content:
+                    rules_content.append(rule.content.strip()[:300])
 
-        # Build config structure
-        config_dict = {
-            "# Configuration file for": intention,
-            "# Customize these settings for your business requirements": None,
-            "# Generated from": domain,
-            "skill_config": {
-                "name": intention,
-                "version": "1.0.0",
-                "enabled": True,
-                "enterprise": enterprise_name or domain,
-                "domain": domain
-            },
-            "execution_settings": {
-                "timeout_seconds": 300,
-                "retry_attempts": 3,
-                "retry_delay_seconds": 5,
-                "async_execution": False,
-                "logging_level": "INFO"
-            },
-            "business_rules": {
-                "# Customize thresholds and limits for your business": None,
-                "approval_required": False,
-                "approval_threshold": 1000,
-                "max_items_per_request": 100,
-                "enable_notifications": True,
-                "escalation_enabled": True
-            },
-            "integration_settings": {
-                "# Configure external system connections": None,
-                "database": {
-                    "enabled": True,
-                    "connection_pool_size": 5,
-                    "query_timeout_seconds": 30
-                },
-                "api": {
-                    "enabled": True,
-                    "base_url": "",
-                    "api_key_env_var": "API_KEY",
-                    "rate_limit_per_minute": 60
-                },
-                "cache": {
-                    "enabled": True,
-                    "ttl_seconds": 3600,
-                    "max_size_mb": 100
-                }
-            },
-            "notification_settings": {
-                "# Configure how notifications are sent": None,
-                "email": {
-                    "enabled": False,
-                    "recipients": [],
-                    "on_success": False,
-                    "on_failure": True,
-                    "on_escalation": True
-                },
-                "slack": {
-                    "enabled": False,
-                    "webhook_url_env_var": "SLACK_WEBHOOK_URL",
-                    "channel": "",
-                    "on_success": False,
-                    "on_failure": True
-                }
-            },
-            "custom_parameters": {
-                "# Add your custom business parameters here": None,
-                "param1": {
-                    "value": "",
-                    "description": "Custom parameter 1"
-                },
-                "param2": {
-                    "value": "",
-                    "description": "Custom parameter 2"
-                }
-            },
-            "feature_flags": {
-                "# Enable or disable specific features": None,
-                "enable_audit_logging": True,
-                "enable_detailed_errors": False,
-                "enable_performance_metrics": True,
-                "enable_dry_run_mode": False,
-                "enable_debug_mode": False
+        if knowledge:
+            for k in knowledge:
+                if k.type == KnowledgeType.PROCEDURE and k.content:
+                    procedures_content.append(k.content.strip()[:300])
+                elif k.type == KnowledgeType.CONSTRAINT and k.content:
+                    exceptions_content.append(k.content.strip()[:300])
+                elif k.type == KnowledgeType.DECISION_RULE and k.content:
+                    rules_content.append(k.content.strip()[:300])
+
+        # Build context for Claude
+        context_parts = [f"Skill Name: {intention}", f"Domain: {domain}"]
+
+        if rules_content:
+            context_parts.append(f"Business Rules:\n- " + "\n- ".join(rules_content[:5]))
+        if procedures_content:
+            context_parts.append(f"Procedures:\n- " + "\n- ".join(procedures_content[:5]))
+        if exceptions_content:
+            context_parts.append(f"Exceptions:\n- " + "\n- ".join(exceptions_content[:3]))
+
+        skill_context = "\n\n".join(context_parts)
+
+        # Generate config schema using Claude API
+        prompt = f"""Analyze this skill and generate a config_schema.json with properties that are DIRECTLY RELEVANT to this specific skill's purpose.
+
+{skill_context}
+
+Generate a JSON config schema with:
+1. "title": the skill name (use: {intention})
+2. "description": a brief description of what this skill does and what can be configured
+3. "properties": an object with 2-4 configuration sections that are SPECIFIC to this skill
+
+IMPORTANT RULES:
+- Property names must be relevant to the skill intention (e.g., for "apply-security-measures" use "security_rules", "operational_measures", "exceptions")
+- DO NOT use generic properties like "execution", "thresholds", "output"
+- Each property should contain actual configurable values extracted from the rules/procedures
+- Use snake_case for property names
+- Include arrays of rules/items that users can customize
+- Keep it simple and relevant
+
+Return ONLY valid JSON, no explanation.
+
+Example for "apply-security-measures" skill:
+{{
+  "title": "apply-security-measures",
+  "description": "Configure security protocols and measures for store operations",
+  "properties": {{
+    "security_rules": ["Rule 1 from content", "Rule 2 from content"],
+    "operational_measures": ["Measure 1", "Measure 2"],
+    "exceptions": ["Exception 1", "Exception 2"]
+  }}
+}}
+
+Now generate for the skill "{intention}":"""
+
+        try:
+            response = self.client.invoke(prompt, max_tokens=1500)
+
+            # Extract JSON from response
+            response_text = response.strip()
+
+            # Find JSON in response
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+
+            if json_start != -1 and json_end > json_start:
+                json_str = response_text[json_start:json_end]
+                # Validate it's valid JSON
+                config_schema = json.loads(json_str)
+
+                # Ensure required fields exist
+                if "title" not in config_schema:
+                    config_schema["title"] = intention
+                if "description" not in config_schema:
+                    config_schema["description"] = f"Configuration for {intention.replace('-', ' ').title()}"
+                if "properties" not in config_schema:
+                    config_schema["properties"] = {}
+
+                logger.info(f"[CONFIG_SCHEMA] Generated dynamic config for: {intention}")
+                return json.dumps(config_schema, indent=2)
+            else:
+                raise ValueError("No valid JSON found in response")
+
+        except Exception as e:
+            logger.warning(f"[CONFIG_SCHEMA] Claude API failed, using fallback: {e}")
+            # Fallback to basic dynamic generation
+            return self._generate_fallback_config_schema(intention, domain, rules_content, procedures_content, exceptions_content)
+
+    def _generate_fallback_config_schema(
+        self,
+        intention: str,
+        domain: str,
+        rules: List[str],
+        procedures: List[str],
+        exceptions: List[str]
+    ) -> str:
+        """Fallback config schema generation when Claude API fails."""
+
+        # Generate property names from intention
+        intention_words = intention.replace('-', '_').split('_')
+
+        # Create dynamic property names based on intention
+        primary_prop = f"{intention_words[0]}_{intention_words[-1]}_rules" if len(intention_words) > 1 else f"{intention_words[0]}_rules"
+        secondary_prop = f"{intention_words[-1]}_procedures" if len(intention_words) > 1 else "procedures"
+
+        config_schema = {
+            "title": intention,
+            "description": f"Configuration for {intention.replace('-', ' ').replace('_', ' ').title()} in {domain}",
+            "properties": {
+                primary_prop: rules[:5] if rules else [],
+                secondary_prop: procedures[:5] if procedures else [],
+                "exceptions": exceptions[:3] if exceptions else []
             }
         }
 
-        # Add extracted thresholds if any were found
-        if thresholds:
-            config_dict["extracted_thresholds"] = {
-                "# These values were extracted from your source documents": None,
-                "# Review and adjust as needed": None,
-                "thresholds": thresholds[:5]  # Limit to 5
-            }
+        # Remove empty arrays
+        config_schema["properties"] = {k: v for k, v in config_schema["properties"].items() if v}
 
-        # Custom YAML dump that handles None values as comments
-        def custom_dump(data, indent=0):
-            lines = []
-            prefix = "  " * indent
-
-            for key, value in data.items():
-                if key.startswith("#"):
-                    lines.append(f"{prefix}{key}")
-                elif value is None:
-                    continue
-                elif isinstance(value, dict):
-                    lines.append(f"{prefix}{key}:")
-                    lines.extend(custom_dump(value, indent + 1))
-                elif isinstance(value, list):
-                    lines.append(f"{prefix}{key}:")
-                    for item in value:
-                        if isinstance(item, dict):
-                            lines.append(f"{prefix}  -")
-                            for k, v in item.items():
-                                lines.append(f"{prefix}    {k}: {repr(v) if isinstance(v, str) else v}")
-                        else:
-                            lines.append(f"{prefix}  - {item}")
-                elif isinstance(value, bool):
-                    lines.append(f"{prefix}{key}: {str(value).lower()}")
-                elif isinstance(value, str):
-                    if value:
-                        lines.append(f"{prefix}{key}: \"{value}\"")
-                    else:
-                        lines.append(f"{prefix}{key}: \"\"")
-                else:
-                    lines.append(f"{prefix}{key}: {value}")
-
-            return lines
-
-        yaml_lines = custom_dump(config_dict)
-        return "\n".join(yaml_lines)
+        return json.dumps(config_schema, indent=2)
 
     def _create_fallback_skill(
-        self, 
-        enterprise_name: Optional[str], 
+        self,
+        enterprise_name: Optional[str],
         knowledge: List[ExtractedKnowledge] = None
     ) -> List[Dict[str, Any]]:
         """Create fallback skill"""
-        
+
         intention = "execute-workflow"
-        
+        domain = enterprise_name or "Enterprise"
+
+        # Generate detailed description for fallback skill
+        fallback_description = (
+            f"The execute workflow skill provides a standardized approach to running documented procedures for {domain} operations. "
+            f"It covers the essential steps for verifying user intent, executing workflow actions in the correct sequence, and validating successful completion. "
+            f"Key focus areas include compliance requirements and quality standards to ensure reliable execution."
+        )
+
         skill_md = f"""---
 name: {intention}
-description: Execute documented workflow
+description: >
+  {fallback_description}
 version: 1.0.0
 triggers:
   - pattern: "(I need|I want) to execute (the|a) workflow"
@@ -1405,7 +1794,7 @@ triggers:
 ---
 
 ## Overview
-Executes workflows per documentation.
+{fallback_description}
 
 ## When to Use
 When customer requests workflow execution.
@@ -1425,21 +1814,21 @@ See examples.yaml
 ## Additional Resources
 - metadata.json
 """
-        
+
         metadata = SkillMetadata(
             name=intention,
-            description="Execute workflow",
+            description=fallback_description,
             version="1.0.0",
             source_documents=["fallback"],
             confidence=0.5,
             created_date=datetime.now().isoformat(),
             enterprise=enterprise_name,
-            domain=enterprise_name or "Enterprise",
+            domain=domain,
             knowledge_extraction_stats={}
         )
         
-        # Generate default config for fallback
-        fallback_config = self._generate_config_yaml(intention, [], enterprise_name or "Enterprise", enterprise_name)
+        # Generate default config schema for fallback
+        fallback_config = self._generate_config_schema_json(intention, [], enterprise_name or "Enterprise", enterprise_name, knowledge)
 
         return [{
             "metadata": asdict(metadata),
@@ -1447,7 +1836,7 @@ See examples.yaml
             "rules_yaml": yaml.dump({"rules": []}, default_flow_style=False),
             "definitions_yaml": yaml.dump({"definitions": []}, default_flow_style=False),
             "examples_yaml": yaml.dump({"examples": []}, default_flow_style=False),
-            "config_yaml": fallback_config,
+            "config_schema_json": fallback_config,
             "script_py": None
         }]
 
@@ -1800,7 +2189,7 @@ Return ONLY valid JSON, no markdown or explanation."""
         │   ├── scripts/
         │   │   └── skill_name.py
         │   ├── SKILL.md
-        │   ├── config.yaml
+        │   ├── config_schema.json
         │   ├── metadata.json
         │   ├── rules.yaml
         │   ├── definitions.yaml
@@ -1823,7 +2212,7 @@ Return ONLY valid JSON, no markdown or explanation."""
             # Save all skill files
             files_to_save = {
                 "SKILL.md": skill["skill_md"],
-                "config.yaml": skill.get("config_yaml", ""),
+                "config_schema.json": skill.get("config_schema_json", ""),
                 "metadata.json": json.dumps(skill["metadata"], indent=2),
                 "rules.yaml": skill["rules_yaml"],
                 "definitions.yaml": skill["definitions_yaml"],
@@ -1937,40 +2326,68 @@ Return ONLY valid JSON, no markdown or explanation."""
 # LAMBDA HANDLER - Async processing with CORS support
 # ============================================================================
 
-def process_extraction(file_content: bytes, filename: str, enterprise_name: Optional[str], job_id: str):
-    """Background processing function"""
+def process_extraction(file_content: bytes, filename: str, enterprise_name: Optional[str], skill_folder: str):
+    """
+    Background processing function.
+
+    Args:
+        file_content: Raw file bytes
+        filename: Original filename
+        enterprise_name: Optional enterprise name for context
+        skill_folder: S3 folder name (enterprise-based, e.g., "retailco")
+
+    IMPORTANT: The skill_folder parameter MUST be used as-is for all S3 operations.
+    Do NOT regenerate or modify the skill_folder - it must match what was returned to the client.
+    """
     try:
-        logger.info(f"[{job_id}] Processing file: {filename}")
-        logger.info(f"[{job_id}] File size: {len(file_content)} bytes")
-        
+        # CRITICAL: Log the exact skill_folder being used - this MUST match what was returned to client
+        logger.info(f"[PROCESS_EXTRACTION] ========================================")
+        logger.info(f"[PROCESS_EXTRACTION] skill_folder parameter: '{skill_folder}'")
+        logger.info(f"[PROCESS_EXTRACTION] enterprise_name parameter: '{enterprise_name}'")
+        logger.info(f"[PROCESS_EXTRACTION] filename parameter: '{filename}'")
+        logger.info(f"[PROCESS_EXTRACTION] ========================================")
+
+        logger.info(f"[{skill_folder}] Processing file: {filename}")
+        logger.info(f"[{skill_folder}] Enterprise: {enterprise_name or 'Will be inferred'}")
+        logger.info(f"[{skill_folder}] File size: {len(file_content)} bytes")
+
+        # Verify initial status exists (sanity check)
+        try:
+            status_key = f"Knowledge_Extraction_To_Skills/{skill_folder}/status.json"
+            get_s3_client().head_object(Bucket=SKILLS_BUCKET, Key=status_key)
+            logger.info(f"[{skill_folder}] Initial status verified at: {status_key}")
+        except Exception as verify_err:
+            logger.warning(f"[{skill_folder}] Could not verify initial status: {verify_err}")
+
         # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp_file:
             tmp_file.write(file_content)
             tmp_path = tmp_file.name
-        
+
         # Parse document to text
         text_content = parse_document(tmp_path, filename)
-        logger.info(f"[{job_id}] Extracted text: {len(text_content)} characters")
-        
+        logger.info(f"[{skill_folder}] Extracted text: {len(text_content)} characters")
+
         # Save as temporary text file for orchestrator
         text_file_path = tmp_path + '.txt'
         with open(text_file_path, 'w', encoding='utf-8') as f:
             f.write(text_content)
-        
+
         # Run knowledge extraction
         output_dir = tempfile.mkdtemp()
-        
+
         orchestrator = KnowledgeCaptureOrchestrator(region=os.environ.get('AWS_REGION', 'us-west-2'))
         result = orchestrator.process_documents(
             document_paths=[text_file_path],
             enterprise_name=enterprise_name,
             output_dir=output_dir
         )
-        
-        # Upload skills to S3
+
+        # Upload skills to S3 using enterprise-based folder name
         s3_paths = []
-        logger.info(f"[{job_id}] Uploading files from: {output_dir}")
-        logger.info(f"[{job_id}] Target bucket: {SKILLS_BUCKET}")
+        logger.info(f"[{skill_folder}] Uploading files from: {output_dir}")
+        logger.info(f"[{skill_folder}] Target bucket: {SKILLS_BUCKET}")
+        logger.info(f"[{skill_folder}] S3 folder: Knowledge_Extraction_To_Skills/{skill_folder}/")
 
         for root, dirs, files in os.walk(output_dir):
             for file in files:
@@ -1978,15 +2395,16 @@ def process_extraction(file_content: bytes, filename: str, enterprise_name: Opti
                 relative_path = os.path.relpath(local_path, output_dir)
                 # Ensure forward slashes for S3 keys (important for cross-platform compatibility)
                 relative_path = relative_path.replace('\\', '/')
-                s3_key = f"Knowledge_Extraction_To_Skills/{job_id}/{relative_path}"
+                # Use enterprise-based skill_folder instead of job_id
+                s3_key = f"Knowledge_Extraction_To_Skills/{skill_folder}/{relative_path}"
 
-                logger.info(f"[{job_id}] Uploading: {local_path} -> s3://{SKILLS_BUCKET}/{s3_key}")
+                logger.info(f"[{skill_folder}] Uploading: {local_path} -> s3://{SKILLS_BUCKET}/{s3_key}")
                 get_s3_client().upload_file(local_path, SKILLS_BUCKET, s3_key)
                 s3_paths.append(s3_key)
-                logger.info(f"[{job_id}] ✅ Uploaded: {s3_key}")
+                logger.info(f"[{skill_folder}] ✅ Uploaded: {s3_key}")
 
-        logger.info(f"[{job_id}] Total files uploaded: {len(s3_paths)}")
-        
+        logger.info(f"[{skill_folder}] Total files uploaded: {len(s3_paths)}")
+
         # Save completion status
         completion_result = {
             'status': 'completed',
@@ -1994,38 +2412,41 @@ def process_extraction(file_content: bytes, filename: str, enterprise_name: Opti
             'result': result,
             's3_bucket': SKILLS_BUCKET,
             's3_paths': s3_paths,
-            'job_id': job_id,
+            'skill_folder': skill_folder,
+            'enterprise_name': enterprise_name,
             'completed_at': datetime.now().isoformat()
         }
-        
+
         get_s3_client().put_object(
             Bucket=SKILLS_BUCKET,
-            Key=f"Knowledge_Extraction_To_Skills/{job_id}/status.json",
+            Key=f"Knowledge_Extraction_To_Skills/{skill_folder}/status.json",
             Body=json.dumps(completion_result, indent=2),
             ContentType='application/json'
         )
-        
-        logger.info(f"[{job_id}] ✅ Processing complete")
-        
+
+        logger.info(f"[{skill_folder}] ✅ Processing complete")
+        logger.info(f"[{skill_folder}] Skills stored at: s3://{SKILLS_BUCKET}/Knowledge_Extraction_To_Skills/{skill_folder}/")
+
         # Cleanup
         os.unlink(tmp_path)
         os.unlink(text_file_path)
-        
+
     except Exception as e:
-        logger.error(f"[{job_id}] ❌ Processing failed: {str(e)}", exc_info=True)
-        
+        logger.error(f"[{skill_folder}] ❌ Processing failed: {str(e)}", exc_info=True)
+
         # Save error status
         error_result = {
             'status': 'failed',
             'error': str(e),
             'type': type(e).__name__,
-            'job_id': job_id,
+            'skill_folder': skill_folder,
+            'enterprise_name': enterprise_name,
             'failed_at': datetime.now().isoformat()
         }
-        
+
         get_s3_client().put_object(
             Bucket=SKILLS_BUCKET,
-            Key=f"Knowledge_Extraction_To_Skills/{job_id}/status.json",
+            Key=f"Knowledge_Extraction_To_Skills/{skill_folder}/status.json",
             Body=json.dumps(error_result, indent=2),
             ContentType='application/json'
         )
@@ -2033,23 +2454,39 @@ def process_extraction(file_content: bytes, filename: str, enterprise_name: Opti
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    UPDATED LAMBDA HANDLER - Supports BOTH upload methods:
-    1. Multipart file upload (POST with multipart/form-data)
-    2. Base64 JSON upload (POST with application/json)
-    3. Status check (GET /status/{job_id})
-    
-    Expected request body for base64 JSON:
+    UPDATED LAMBDA HANDLER - Supports multiple upload methods:
+
+    ENDPOINTS:
+    1. GET /upload-url?filename=X&enterprise_name=Y  - Get presigned URL for direct S3 upload (RECOMMENDED for large files)
+    2. POST /extract with s3_key                     - Process file already uploaded to S3 (RECOMMENDED)
+    3. POST /extract with multipart/form-data        - Direct file upload (legacy, small files only)
+    4. POST /extract with base64 JSON                - Base64 encoded file (legacy, small files only)
+    5. GET /status/{skill_folder}                    - Check extraction status
+
+    RECOMMENDED FLOW FOR LARGE FILES:
+    1. Call GET /upload-url?filename=document.pdf&enterprise_name=RetailCo
+    2. Upload file directly to S3 using the returned presigned URL (PUT request)
+    3. Call POST /extract with {"s3_key": "...", "filename": "...", "enterprise_name": "..."}
+
+    Skills are stored with enterprise-based naming (single folder per enterprise):
+    - S3 path: Knowledge_Extraction_To_Skills/{enterprise_name}/
+    - Example: Knowledge_Extraction_To_Skills/retailco/
+
+    Expected request body for S3 key method (RECOMMENDED):
+    {
+        "s3_key": "pending_uploads/retailco/20260213_..._document.pdf",
+        "filename": "document.pdf",
+        "enterprise_name": "RetailCo" (optional)
+    }
+
+    Expected request body for base64 JSON (legacy):
     {
         "file": "base64_encoded_file_content",
         "filename": "document.pdf",
         "enterprise_name": "RetailCo" (optional)
     }
-    
-    Expected multipart form-data:
-    - file: [binary file]
-    - enterprise_name: "RetailCo" (optional)
     """
-    
+
     try:
         # Handle OPTIONS request (CORS preflight)
         if event.get('httpMethod') == 'OPTIONS':
@@ -2058,45 +2495,217 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'headers': CORS_HEADERS,
                 'body': json.dumps({'message': 'CORS preflight'})
             }
-        
-        # Handle GET - Status check
+
+        # Handle GET requests
         if event.get('httpMethod') == 'GET':
-            if event.get('pathParameters') and 'job_id' in event['pathParameters']:
-                job_id = event['pathParameters']['job_id']
-                
+            # REST API uses 'path' and 'resource', HTTP API uses 'rawPath'
+            path = event.get('path', '') or event.get('rawPath', '') or ''
+            resource = event.get('resource', '') or ''
+            query_params = event.get('queryStringParameters', {}) or {}
+            path_params = event.get('pathParameters', {}) or {}
+
+            logger.info(f"[GET_REQUEST] path={path}, resource={resource}, query_params={query_params}")
+
+            # DEBUG: Return event structure for troubleshooting (remove after fixing)
+            if 'debug' in (query_params or {}):
+                return {
+                    'statusCode': 200,
+                    'headers': CORS_HEADERS,
+                    'body': json.dumps({
+                        'debug': True,
+                        'path': path,
+                        'resource': resource,
+                        'query_params': query_params,
+                        'path_params': path_params,
+                        'httpMethod': event.get('httpMethod'),
+                        'event_keys': list(event.keys())
+                    }, indent=2)
+                }
+
+            # NEW: GET /upload-url - Generate presigned URL for direct S3 upload
+            # Check both path and resource for compatibility with REST API and HTTP API
+            if '/upload-url' in path or '/upload-url' in resource or 'upload-url' in path or 'upload-url' in resource:
+                filename = query_params.get('filename') if query_params else None
+                enterprise_name = (query_params.get('enterprise_name') or query_params.get('enterpriseName')) if query_params else None
+                user_id = (query_params.get('user_id') or query_params.get('userId')) if query_params else None
+
+                if not filename:
+                    return {
+                        'statusCode': 400,
+                        'headers': CORS_HEADERS,
+                        'body': json.dumps({
+                            'error': 'Missing required parameter: filename',
+                            'usage': 'GET /upload-url?filename=document.pdf&enterprise_name=RetailCo',
+                            'debug': {
+                                'path': path,
+                                'resource': resource,
+                                'query_params': query_params
+                            }
+                        })
+                    }
+
+                logger.info(f"[UPLOAD_URL] Generating presigned URL for: {filename}, user_id: {user_id}, enterprise: {enterprise_name}")
+
                 try:
-                    response = get_s3_client().get_object(
-                        Bucket=SKILLS_BUCKET,
-                        Key=f"Knowledge_Extraction_To_Skills/{job_id}/status.json"
-                    )
-                    status_data = json.loads(response['Body'].read().decode('utf-8'))
-                    
+                    upload_info = generate_presigned_upload_url(filename, enterprise_name, user_id)
+
+                    return {
+                        'statusCode': 200,
+                        'headers': CORS_HEADERS,
+                        'body': json.dumps({
+                            'upload_url': upload_info['upload_url'],
+                            's3_key': upload_info['s3_key'],
+                            'expires_in_seconds': upload_info['expires_in_seconds'],
+                            'filename': filename,
+                            'user_id': user_id,
+                            'enterprise_name': enterprise_name,
+                            'instructions': {
+                                'step1': 'Upload your file using PUT request to upload_url',
+                                'step2': 'Call POST /extract with s3_key, filename, user_id, and enterprise_name',
+                                'example_curl': f"curl -X PUT -T yourfile.pdf '{upload_info['upload_url']}'"
+                            }
+                        })
+                    }
+                except Exception as e:
+                    logger.error(f"[UPLOAD_URL] Error generating presigned URL: {str(e)}", exc_info=True)
+                    return {
+                        'statusCode': 500,
+                        'headers': CORS_HEADERS,
+                        'body': json.dumps({
+                            'error': f'Failed to generate upload URL: {str(e)}',
+                            'bucket': SKILLS_BUCKET,
+                            'hint': 'Check that SKILLS_BUCKET environment variable is set'
+                        })
+                    }
+
+            # GET /status/{skill_folder} - Status check
+            folder_id = path_params.get('skill_folder') or path_params.get('job_id')
+
+            if folder_id:
+                # BACKWARD COMPATIBILITY: Try multiple S3 paths
+                # 1. Primary path: Knowledge_Extraction_To_Skills/{folder_id}/status.json
+                # 2. Legacy path: skills/{folder_id}/status.json (old code)
+                # 3. Alternative: skills_phase3/{folder_id}/status.json
+                s3_paths_to_try = [
+                    f"Knowledge_Extraction_To_Skills/{folder_id}/status.json",
+                    f"skills/{folder_id}/status.json",
+                    f"skills_phase3/{folder_id}/status.json",
+                    # Also try without the folder structure (direct status.json)
+                    f"Knowledge_Extraction_To_Skills/{folder_id}/skills/{folder_id}/status.json",
+                ]
+
+                status_data = None
+                found_path = None
+
+                for s3_path in s3_paths_to_try:
+                    try:
+                        logger.info(f"[STATUS_CHECK] Trying path: s3://{SKILLS_BUCKET}/{s3_path}")
+                        response = get_s3_client().get_object(
+                            Bucket=SKILLS_BUCKET,
+                            Key=s3_path
+                        )
+                        status_data = json.loads(response['Body'].read().decode('utf-8'))
+                        found_path = s3_path
+                        logger.info(f"[STATUS_CHECK] Found status at: {s3_path}")
+                        break
+                    except Exception as e:
+                        logger.debug(f"[STATUS_CHECK] Not found at {s3_path}: {str(e)}")
+                        continue
+
+                if status_data:
+                    # Add the path where we found it for debugging
+                    status_data['_found_at_path'] = found_path
                     return {
                         'statusCode': 200,
                         'headers': CORS_HEADERS,
                         'body': json.dumps(status_data)
                     }
-                except get_s3_client().exceptions.NoSuchKey:
+                else:
+                    # Not found in any path - list what's actually in the bucket for this prefix
+                    logger.warning(f"[STATUS_CHECK] Skill folder '{folder_id}' not found in any path")
+
+                    # Try to list objects to help debug
+                    existing_folders = []
+                    try:
+                        list_response = get_s3_client().list_objects_v2(
+                            Bucket=SKILLS_BUCKET,
+                            Prefix='Knowledge_Extraction_To_Skills/',
+                            Delimiter='/',
+                            MaxKeys=10
+                        )
+                        for prefix in list_response.get('CommonPrefixes', []):
+                            folder_name = prefix['Prefix'].replace('Knowledge_Extraction_To_Skills/', '').rstrip('/')
+                            if folder_name:
+                                existing_folders.append(folder_name)
+                    except Exception as list_error:
+                        logger.error(f"[STATUS_CHECK] Error listing folders: {str(list_error)}")
+
                     return {
                         'statusCode': 404,
                         'headers': CORS_HEADERS,
                         'body': json.dumps({
-                            'error': 'Job not found',
-                            'job_id': job_id
+                            'error': 'Skill folder not found',
+                            'skill_folder': folder_id,
+                            'paths_checked': s3_paths_to_try,
+                            'hint': 'The extraction job may still be processing, or the folder name may be incorrect.',
+                            'recent_folders': existing_folders[:5] if existing_folders else [],
+                            'suggestion': 'Ensure you are using the skill_folder returned from the POST /extract response'
                         })
                     }
-        
+
         # Check if this is a background invocation
         if event.get('is_background_job'):
             # Background processing (no CORS needed for internal calls)
             job_data = event['job_data']
-            file_content = base64.b64decode(job_data['file'])
+
+            # CRITICAL: Log received values to trace any mismatch
+            received_skill_folder = job_data.get('skill_folder')
+            received_enterprise_name = job_data.get('enterprise_name')
+            received_filename = job_data.get('filename')
+
+            logger.info(f"[ASYNC_JOB] ========== BACKGROUND JOB STARTED ==========")
+            logger.info(f"[ASYNC_JOB] Received skill_folder: '{received_skill_folder}'")
+            logger.info(f"[ASYNC_JOB] Received enterprise_name: '{received_enterprise_name}'")
+            logger.info(f"[ASYNC_JOB] Received filename: '{received_filename}'")
+
+            # Validate skill_folder is present
+            if not received_skill_folder:
+                logger.error("[ASYNC_JOB] ERROR: skill_folder is missing from job_data!")
+                return {'statusCode': 400, 'body': 'Missing skill_folder in job_data'}
+
+            # Get file content - from S3 (recommended) or base64 (legacy)
+            use_s3_key = job_data.get('use_s3_key', False)
+            uploaded_s3_key = job_data.get('s3_key')
+
+            if use_s3_key and uploaded_s3_key:
+                # S3 KEY METHOD (RECOMMENDED) - Read file directly from S3
+                logger.info(f"[ASYNC_JOB] Reading file from S3: {uploaded_s3_key}")
+                try:
+                    file_content = read_file_from_s3(uploaded_s3_key)
+                    logger.info(f"[ASYNC_JOB] File read from S3: {len(file_content)} bytes")
+
+                    # Clean up the uploaded file after reading (optional - keeps S3 clean)
+                    delete_uploaded_file(uploaded_s3_key)
+                except Exception as e:
+                    logger.error(f"[ASYNC_JOB] Failed to read from S3: {e}")
+                    return {'statusCode': 500, 'body': f'Failed to read file from S3: {str(e)}'}
+            else:
+                # LEGACY METHOD - Decode from base64
+                logger.info("[ASYNC_JOB] Using legacy base64 method")
+                if 'file' not in job_data:
+                    logger.error("[ASYNC_JOB] ERROR: Neither s3_key nor file provided!")
+                    return {'statusCode': 400, 'body': 'Missing file content in job_data'}
+
+                file_content = base64.b64decode(job_data['file'])
+                logger.info(f"[ASYNC_JOB] File content decoded from base64: {len(file_content)} bytes")
+
             process_extraction(
                 file_content=file_content,
-                filename=job_data['filename'],
-                enterprise_name=job_data.get('enterprise_name'),
-                job_id=job_data['job_id']
+                filename=received_filename,
+                enterprise_name=received_enterprise_name,
+                skill_folder=received_skill_folder
             )
+            logger.info(f"[ASYNC_JOB] ========== BACKGROUND JOB COMPLETED ==========")
             return {'statusCode': 200, 'body': 'Background processing complete'}
         
         # Handle POST - File upload
@@ -2117,10 +2726,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     body = base64.b64encode(body.encode()).decode()
                 
                 parsed_data = parse_multipart_form_data(body, content_type)
-                
+
                 file_content = parsed_data.get('file')
                 filename = parsed_data.get('filename')
                 enterprise_name = parsed_data.get('enterprise_name')
+                user_id = parsed_data.get('user_id')
                 
                 if not file_content or not filename:
                     return {
@@ -2131,28 +2741,141 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         })
                     }
                 
-                # Convert to base64 for internal processing
+                # Convert to base64 for internal processing (legacy method)
                 file_base64 = base64.b64encode(file_content).decode('utf-8')
-            
-            # Method 2: Base64 JSON upload (your current method)
+                use_s3_key = False
+                uploaded_file_s3_key = None
+
+            # Method 2: JSON upload (supports action, s3_key, or base64)
             elif 'application/json' in content_type:
-                logger.info("Processing JSON with base64 file")
-                
                 body = json.loads(event.get('body', '{}'))
-                
-                if 'file' not in body or 'filename' not in body:
+
+                # Log all keys received for debugging
+                logger.info(f"[JSON_PARSE] Received keys in body: {list(body.keys())}")
+
+                # Support multiple variations of enterprise_name field
+                enterprise_name = (
+                    body.get('enterprise_name') or
+                    body.get('enterpriseName') or
+                    body.get('enterprise-name') or
+                    body.get('EnterpriseName')
+                )
+
+                # Support user_id for folder naming (takes priority over enterprise_name)
+                user_id = (
+                    body.get('user_id') or
+                    body.get('userId') or
+                    body.get('user-id') or
+                    body.get('UserId')
+                )
+
+                filename = body.get('filename')
+
+                # ACTION: get_upload_url - Return presigned URL for direct S3 upload (NO new route needed!)
+                if body.get('action') == 'get_upload_url':
+                    if not filename:
+                        return {
+                            'statusCode': 400,
+                            'headers': CORS_HEADERS,
+                            'body': json.dumps({
+                                'error': 'Missing required field: filename',
+                                'usage': {
+                                    'action': 'get_upload_url',
+                                    'filename': 'document.pdf',
+                                    'enterprise_name': 'RetailCo (optional)'
+                                }
+                            })
+                        }
+
+                    logger.info(f"[GET_UPLOAD_URL] Generating presigned URL for: {filename}, user_id: {user_id}, enterprise: {enterprise_name}")
+
+                    try:
+                        upload_info = generate_presigned_upload_url(filename, enterprise_name, user_id)
+
+                        return {
+                            'statusCode': 200,
+                            'headers': CORS_HEADERS,
+                            'body': json.dumps({
+                                'upload_url': upload_info['upload_url'],
+                                's3_key': upload_info['s3_key'],
+                                'expires_in_seconds': upload_info['expires_in_seconds'],
+                                'filename': filename,
+                                'user_id': user_id,
+                                'enterprise_name': enterprise_name,
+                                'next_step': {
+                                    'description': 'Upload file to S3, then call /extract with s3_key',
+                                    'step1': 'PUT your file to upload_url',
+                                    'step2': 'POST /extract with the body below',
+                                    'example_body': {
+                                        's3_key': upload_info['s3_key'],
+                                        'filename': filename,
+                                        'user_id': user_id,
+                                        'enterprise_name': enterprise_name
+                                    }
+                                }
+                            })
+                        }
+                    except Exception as e:
+                        logger.error(f"[GET_UPLOAD_URL] Error: {str(e)}", exc_info=True)
+                        return {
+                            'statusCode': 500,
+                            'headers': CORS_HEADERS,
+                            'body': json.dumps({
+                                'error': f'Failed to generate upload URL: {str(e)}',
+                                'bucket': SKILLS_BUCKET
+                            })
+                        }
+
+                # Method 2a: S3 key method (RECOMMENDED for large files)
+                if 's3_key' in body:
+                    uploaded_file_s3_key = body['s3_key']  # Store uploaded file's S3 key separately
+                    logger.info(f"[S3_KEY_METHOD] Processing file from S3: {uploaded_file_s3_key}")
+
+                    if not filename:
+                        # Extract filename from s3_key if not provided
+                        filename = Path(uploaded_file_s3_key).name
+                        logger.info(f"[S3_KEY_METHOD] Extracted filename from s3_key: {filename}")
+
+                    # Store s3_key for later use (instead of file_base64)
+                    use_s3_key = True
+                    file_base64 = None  # Will read from S3 in background job
+                    logger.info(f"[S3_KEY_METHOD] Will read file from S3 in background job")
+
+                # Method 2b: Base64 method (legacy, for small files)
+                elif 'file' in body:
+                    logger.info("Processing JSON with base64 file (legacy method)")
+
+                    if not filename:
+                        return {
+                            'statusCode': 400,
+                            'headers': CORS_HEADERS,
+                            'body': json.dumps({
+                                'error': 'Missing required field: filename',
+                                'hint': 'Include filename in your request'
+                            })
+                        }
+
+                    file_base64 = body['file']
+                    use_s3_key = False
+                    uploaded_file_s3_key = None
+
+                else:
                     return {
                         'statusCode': 400,
                         'headers': CORS_HEADERS,
                         'body': json.dumps({
-                            'error': 'Missing required fields: file, filename',
-                            'hint': 'Send either multipart/form-data or JSON with base64-encoded file'
+                            'error': 'Missing required fields: action, s3_key, or file',
+                            'hint': 'Use action=get_upload_url first, then s3_key to process',
+                            'recommended_flow': [
+                                '1. POST /extract with {"action": "get_upload_url", "filename": "doc.pdf", "enterprise_name": "RetailCo"}',
+                                '2. PUT file to the returned upload_url',
+                                '3. POST /extract with {"s3_key": "...", "filename": "doc.pdf", "enterprise_name": "RetailCo"}'
+                            ],
+                            'legacy_option': 'Or send {"file": "base64_content", "filename": "doc.pdf"} for small files'
                         })
                     }
-                
-                file_base64 = body['file']
-                filename = body['filename']
-                enterprise_name = body.get('enterprise_name')
+
+                logger.info(f"[JSON_PARSE] Extracted: filename='{filename}', enterprise_name='{enterprise_name}', use_s3_key={use_s3_key}")
             
             else:
                 return {
@@ -2165,27 +2888,76 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     })
                 }
             
-            # Generate unique job ID
-            job_id = f"job-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}"
-            
+            # Generate user-based or enterprise-based skill folder name
+            # Priority: user_id > enterprise_name > extract from filename
+            # CRITICAL: Log all inputs for debugging folder name mismatch issues
+            logger.info(f"[FOLDER_GEN] Raw user_id from request: '{user_id}' (type: {type(user_id).__name__ if user_id else 'NoneType'})")
+            logger.info(f"[FOLDER_GEN] Raw enterprise_name from request: '{enterprise_name}' (type: {type(enterprise_name).__name__})")
+            logger.info(f"[FOLDER_GEN] Raw filename from request: '{filename}'")
+
+            # Normalize user_id - treat empty strings as None
+            if user_id is not None and isinstance(user_id, str):
+                user_id = user_id.strip() if user_id.strip() else None
+                logger.info(f"[FOLDER_GEN] Normalized user_id: '{user_id}'")
+
+            # Normalize enterprise_name - treat empty strings as None
+            if enterprise_name is not None and isinstance(enterprise_name, str):
+                enterprise_name = enterprise_name.strip() if enterprise_name.strip() else None
+                logger.info(f"[FOLDER_GEN] Normalized enterprise_name: '{enterprise_name}'")
+
+            skill_folder = generate_skill_folder_name(enterprise_name, filename, user_id)
+            logger.info(f"[FOLDER_GEN] Generated skill_folder: '{skill_folder}'")
+
+            # Determine the effective enterprise name for metadata
+            effective_enterprise_name = enterprise_name or extract_enterprise_from_filename(filename)
+            logger.info(f"[FOLDER_GEN] Effective enterprise_name for metadata: '{effective_enterprise_name}'")
+
             # Save initial status
             initial_status = {
                 'status': 'processing',
                 'message': 'Extraction job started',
-                'job_id': job_id,
+                'skill_folder': skill_folder,
+                'user_id': user_id,
+                'enterprise_name': effective_enterprise_name,
                 'filename': filename,
-                'enterprise_name': enterprise_name,
                 'started_at': datetime.now().isoformat(),
-                'estimated_completion': '5-10 minutes'
+                'estimated_completion': '5-10 minutes',
+                's3_path': f"s3://{SKILLS_BUCKET}/Knowledge_Extraction_To_Skills/{skill_folder}/"
             }
-            
+
+            # Save initial status to S3 and verify it was saved
+            s3_key = f"Knowledge_Extraction_To_Skills/{skill_folder}/status.json"
+            logger.info(f"[FOLDER_GEN] Saving initial status to: s3://{SKILLS_BUCKET}/{s3_key}")
             get_s3_client().put_object(
                 Bucket=SKILLS_BUCKET,
-                Key=f"Knowledge_Extraction_To_Skills/{job_id}/status.json",
+                Key=s3_key,
                 Body=json.dumps(initial_status, indent=2),
                 ContentType='application/json'
             )
-            
+            logger.info(f"[FOLDER_GEN] Initial status saved successfully")
+
+            # Prepare job data - CRITICAL: use the SAME skill_folder that was saved
+            # Use s3_key method (recommended) or file base64 (legacy)
+            job_data = {
+                'filename': filename,
+                'user_id': user_id,  # Pass user_id (takes priority for folder naming)
+                'enterprise_name': enterprise_name,  # Pass original (may be None)
+                'skill_folder': skill_folder,  # MUST match the saved status folder
+                'use_s3_key': use_s3_key  # Flag to indicate which method to use
+            }
+
+            if use_s3_key:
+                # S3 key method - much smaller payload, no base64 overhead
+                job_data['s3_key'] = uploaded_file_s3_key  # Use the uploaded file's S3 key, NOT status.json
+                logger.info(f"[ASYNC_INVOKE] Using S3 key method: {uploaded_file_s3_key}")
+            else:
+                # Legacy base64 method
+                job_data['file'] = file_base64
+                logger.info(f"[ASYNC_INVOKE] Using base64 method (legacy)")
+
+            logger.info(f"[ASYNC_INVOKE] Invoking async with skill_folder: '{job_data['skill_folder']}'")
+            logger.info(f"[ASYNC_INVOKE] Invoking async with enterprise_name: '{job_data['enterprise_name']}'")
+
             # Invoke Lambda asynchronously
             lambda_client = boto3.client('lambda')
             lambda_client.invoke(
@@ -2193,37 +2965,39 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 InvocationType='Event',  # Async invocation
                 Payload=json.dumps({
                     'is_background_job': True,
-                    'job_data': {
-                        'file': file_base64,
-                        'filename': filename,
-                        'enterprise_name': enterprise_name,
-                        'job_id': job_id
-                    }
+                    'job_data': job_data
                 })
             )
-            
-            logger.info(f"[{job_id}] Async job started")
-            
+
+            logger.info(f"[{skill_folder}] Async job started successfully")
+
             # Return immediately with CORS headers
+            # CRITICAL: Return the SAME skill_folder that was used for S3 storage
+            response_body = {
+                'status': 'accepted',
+                'message': 'Extraction job started',
+                'skill_folder': skill_folder,
+                'user_id': user_id,
+                'enterprise_name': effective_enterprise_name,
+                'filename': filename,
+                'check_status_url': f"GET /status/{skill_folder}",
+                's3_path': f"Knowledge_Extraction_To_Skills/{skill_folder}/",
+                'estimated_completion': '5-10 minutes'
+            }
+            logger.info(f"[RESPONSE] Returning skill_folder: '{skill_folder}'")
+
             return {
                 'statusCode': 202,  # Accepted
                 'headers': CORS_HEADERS,
-                'body': json.dumps({
-                    'status': 'accepted',
-                    'message': 'Extraction job started',
-                    'job_id': job_id,
-                    'filename': filename,
-                    'check_status_url': f"GET /status/{job_id}",
-                    'estimated_completion': '5-10 minutes'
-                })
+                'body': json.dumps(response_body)
             }
-        
+
         return {
             'statusCode': 400,
             'headers': CORS_HEADERS,
             'body': json.dumps({
                 'error': 'Invalid request',
-                'supported_methods': ['POST /extract', 'GET /status/{job_id}']
+                'supported_methods': ['POST /extract', 'GET /status/{skill_folder}']
             })
         }
         
