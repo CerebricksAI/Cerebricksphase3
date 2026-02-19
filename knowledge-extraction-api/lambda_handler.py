@@ -192,6 +192,49 @@ def sanitize_for_s3_key(name: str) -> str:
     return sanitized
 
 
+def sanitize_email_for_s3_key(email: str) -> str:
+    """
+    Sanitize an email address for use as S3 key component.
+    Preserves email structure (@ and .) for readability.
+    - Converts to lowercase
+    - Keeps @ and . characters
+    - Replaces other special chars with hyphens
+    - Removes consecutive hyphens
+
+    Example: Akhil.Parelly@quadranttechnologies.com -> akhil.parelly@quadranttechnologies.com
+    """
+    if not email:
+        return ""
+
+    # Convert to lowercase and strip whitespace
+    sanitized = email.lower().strip()
+
+    # Replace spaces and most special chars with hyphens, but KEEP @ and .
+    sanitized = re.sub(r'[\s_,;:!#$%^&*()+=\[\]{}|\\<>?/\'\"]+', '-', sanitized)
+
+    # Remove any remaining non-alphanumeric chars except hyphens, @, and .
+    sanitized = re.sub(r'[^a-z0-9\-@\.]', '', sanitized)
+
+    # Remove consecutive hyphens
+    sanitized = re.sub(r'-+', '-', sanitized)
+
+    # Remove leading/trailing hyphens
+    sanitized = sanitized.strip('-')
+
+    return sanitized
+
+
+def is_valid_email(value: str) -> bool:
+    """
+    Check if a string looks like an email address.
+    """
+    if not value:
+        return False
+    # Simple email pattern check
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return bool(re.match(email_pattern, value.strip()))
+
+
 def extract_enterprise_from_filename(filename: str) -> str:
     """
     Try to extract enterprise/company name from filename.
@@ -249,27 +292,40 @@ def extract_enterprise_from_filename(filename: str) -> str:
     return ""
 
 
-def generate_skill_folder_name(enterprise_name: Optional[str], filename: str, user_id: Optional[str] = None) -> str:
+def generate_skill_folder_name(enterprise_name: Optional[str], filename: str, user_id: Optional[str] = None, email_id: Optional[str] = None) -> str:
     """
     Generate a skill folder name for S3 storage.
 
     Priority:
-    1. Use provided user_id (sanitized) - e.g., "akhilparelly"
-    2. Use provided enterprise_name (sanitized)
-    3. Extract from filename
-    4. Fallback to 'enterprise-skill'
+    1. Use provided email_id (preserves email format) - e.g., "akhil.parelly@quadranttechnologies.com"
+    2. Use provided user_id (sanitized) - e.g., "akhilparelly"
+    3. Use provided enterprise_name (sanitized)
+    4. Extract from filename
+    5. Fallback to 'enterprise-skill'
 
     Uses a single folder per user/enterprise to consolidate all extractions.
 
-    Returns: e.g., "akhilparelly" or "retailco" or "acme-corp"
+    Returns: e.g., "akhil.parelly@quadranttechnologies.com" or "akhilparelly" or "retailco"
     """
     base_name = None
     source = None
 
-    # Priority 1: Use provided user_id
-    if user_id:
-        base_name = sanitize_for_s3_key(user_id)
+    # Priority 1: Use provided email_id (preserves email format)
+    if email_id and is_valid_email(email_id):
+        base_name = sanitize_email_for_s3_key(email_id)
         if base_name:
+            source = "email_id"
+            logger.info(f"[SKILL_FOLDER] Using provided email_id: '{email_id}' -> '{base_name}'")
+
+    # Priority 2: Use provided user_id (check if it's an email)
+    if not base_name and user_id:
+        if is_valid_email(user_id):
+            # user_id is actually an email, preserve the format
+            base_name = sanitize_email_for_s3_key(user_id)
+            source = "user_id (email format)"
+            logger.info(f"[SKILL_FOLDER] Using provided user_id as email: '{user_id}' -> '{base_name}'")
+        else:
+            base_name = sanitize_for_s3_key(user_id)
             source = "user_id"
             logger.info(f"[SKILL_FOLDER] Using provided user_id: '{user_id}' -> '{base_name}'")
 
@@ -2769,6 +2825,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     body.get('UserId')
                 )
 
+                # Support email_id for folder naming (highest priority - preserves email format)
+                # Example: Akhil.Parelly@quadranttechnologies.com -> akhil.parelly@quadranttechnologies.com
+                email_id = (
+                    body.get('email_id') or
+                    body.get('emailId') or
+                    body.get('email-id') or
+                    body.get('EmailId') or
+                    body.get('email') or
+                    body.get('Email')
+                )
+
                 filename = body.get('filename')
 
                 # ACTION: get_upload_url - Return presigned URL for direct S3 upload (NO new route needed!)
@@ -2889,11 +2956,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 }
             
             # Generate user-based or enterprise-based skill folder name
-            # Priority: user_id > enterprise_name > extract from filename
+            # Priority: email_id > user_id > enterprise_name > extract from filename
             # CRITICAL: Log all inputs for debugging folder name mismatch issues
+            logger.info(f"[FOLDER_GEN] Raw email_id from request: '{email_id}' (type: {type(email_id).__name__ if email_id else 'NoneType'})")
             logger.info(f"[FOLDER_GEN] Raw user_id from request: '{user_id}' (type: {type(user_id).__name__ if user_id else 'NoneType'})")
             logger.info(f"[FOLDER_GEN] Raw enterprise_name from request: '{enterprise_name}' (type: {type(enterprise_name).__name__})")
             logger.info(f"[FOLDER_GEN] Raw filename from request: '{filename}'")
+
+            # Normalize email_id - treat empty strings as None
+            if email_id is not None and isinstance(email_id, str):
+                email_id = email_id.strip() if email_id.strip() else None
+                logger.info(f"[FOLDER_GEN] Normalized email_id: '{email_id}'")
 
             # Normalize user_id - treat empty strings as None
             if user_id is not None and isinstance(user_id, str):
@@ -2905,7 +2978,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 enterprise_name = enterprise_name.strip() if enterprise_name.strip() else None
                 logger.info(f"[FOLDER_GEN] Normalized enterprise_name: '{enterprise_name}'")
 
-            skill_folder = generate_skill_folder_name(enterprise_name, filename, user_id)
+            skill_folder = generate_skill_folder_name(enterprise_name, filename, user_id, email_id)
             logger.info(f"[FOLDER_GEN] Generated skill_folder: '{skill_folder}'")
 
             # Determine the effective enterprise name for metadata
@@ -2917,6 +2990,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'status': 'processing',
                 'message': 'Extraction job started',
                 'skill_folder': skill_folder,
+                'email_id': email_id,
                 'user_id': user_id,
                 'enterprise_name': effective_enterprise_name,
                 'filename': filename,
@@ -2940,7 +3014,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # Use s3_key method (recommended) or file base64 (legacy)
             job_data = {
                 'filename': filename,
-                'user_id': user_id,  # Pass user_id (takes priority for folder naming)
+                'email_id': email_id,  # Pass email_id (highest priority for folder naming)
+                'user_id': user_id,  # Pass user_id (second priority for folder naming)
                 'enterprise_name': enterprise_name,  # Pass original (may be None)
                 'skill_folder': skill_folder,  # MUST match the saved status folder
                 'use_s3_key': use_s3_key  # Flag to indicate which method to use
@@ -2977,6 +3052,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'status': 'accepted',
                 'message': 'Extraction job started',
                 'skill_folder': skill_folder,
+                'email_id': email_id,
                 'user_id': user_id,
                 'enterprise_name': effective_enterprise_name,
                 'filename': filename,
