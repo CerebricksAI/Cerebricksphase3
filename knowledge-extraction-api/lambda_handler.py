@@ -5,6 +5,7 @@ import tempfile
 import yaml
 import logging
 import re
+import urllib.parse
 from typing import Dict, List, Any, Optional, Tuple, Set
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
@@ -2745,6 +2746,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             folder_id = path_params.get('skill_folder') or path_params.get('job_id')
 
             if folder_id:
+                # Normalize folder_id to match how it was created:
+                # 1. URL decode (@ might be passed as %40)
+                # 2. Apply same sanitization used during folder creation
+                original_folder_id = folder_id
+                folder_id = urllib.parse.unquote(folder_id)
+
+                # If it looks like an email, apply email sanitization (lowercase, etc.)
+                if is_valid_email(folder_id):
+                    folder_id = sanitize_email_for_s3_key(folder_id)
+                    logger.info(f"[STATUS_CHECK] Normalized email folder_id: '{original_folder_id}' -> '{folder_id}'")
+                elif folder_id != original_folder_id:
+                    logger.info(f"[STATUS_CHECK] URL decoded folder_id: '{original_folder_id}' -> '{folder_id}'")
                 # BACKWARD COMPATIBILITY: Try multiple S3 paths
                 # 1. Primary path: Knowledge_Extraction_To_Skills/{folder_id}/status.json
                 # 2. Legacy path: skills/{folder_id}/status.json (old code)
