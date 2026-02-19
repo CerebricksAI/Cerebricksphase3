@@ -2859,7 +2859,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     logger.error("[ASYNC_JOB] ERROR: Neither s3_key nor file provided!")
                     return {'statusCode': 400, 'body': 'Missing file content in job_data'}
 
-                file_content = base64.b64decode(job_data['file'])
+                # Validate base64 content before decoding
+                file_base64 = job_data['file']
+                if not file_base64 or len(file_base64) < 10:
+                    logger.error(f"[ASYNC_JOB] ERROR: Invalid base64 content - length={len(file_base64) if file_base64 else 0}, preview='{str(file_base64)[:50] if file_base64 else 'None'}'")
+                    return {'statusCode': 400, 'body': f'Invalid file content: base64 string too short (length={len(file_base64) if file_base64 else 0})'}
+
+                try:
+                    file_content = base64.b64decode(file_base64)
+                except Exception as decode_err:
+                    logger.error(f"[ASYNC_JOB] ERROR: Base64 decode failed - {str(decode_err)}, content_length={len(file_base64)}, preview='{file_base64[:100] if len(file_base64) > 100 else file_base64}'")
+                    return {'statusCode': 400, 'body': f'Invalid base64 file content: {str(decode_err)}'}
                 logger.info(f"[ASYNC_JOB] File content decoded from base64: {len(file_content)} bytes")
 
             process_extraction(
@@ -2894,7 +2904,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 filename = parsed_data.get('filename')
                 enterprise_name = parsed_data.get('enterprise_name')
                 user_id = parsed_data.get('user_id')
-                
+                # Extract email_id from multipart form data (highest priority for folder naming)
+                email_id = (
+                    parsed_data.get('email_id') or
+                    parsed_data.get('emailId') or
+                    parsed_data.get('email-id') or
+                    parsed_data.get('email') or
+                    parsed_data.get('Email')
+                )
+                logger.info(f"[MULTIPART] Extracted email_id: '{email_id}', user_id: '{user_id}'")
+
                 if not file_content or not filename:
                     return {
                         'statusCode': 400,
@@ -3030,8 +3049,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         }
 
                     file_base64 = body['file']
+                    # Validate base64 content
+                    if not file_base64 or not isinstance(file_base64, str) or len(file_base64) < 10:
+                        logger.error(f"[JSON_PARSE] Invalid file content: type={type(file_base64).__name__}, length={len(file_base64) if file_base64 else 0}")
+                        return {
+                            'statusCode': 400,
+                            'headers': CORS_HEADERS,
+                            'body': json.dumps({
+                                'error': 'Invalid file content',
+                                'hint': 'file must be a valid base64-encoded string',
+                                'received_length': len(file_base64) if file_base64 else 0,
+                                'received_type': type(file_base64).__name__
+                            })
+                        }
                     use_s3_key = False
                     uploaded_file_s3_key = None
+                    logger.info(f"[JSON_PARSE] Received base64 file content: {len(file_base64)} chars")
 
                 else:
                     return {
