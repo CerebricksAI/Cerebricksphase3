@@ -142,6 +142,89 @@ def delete_uploaded_file(s3_key: str):
         logger.warning(f"[S3_CLEANUP] Failed to delete {s3_key}: {e}")
 
 
+def fetch_skill_details(folder_id: str) -> list:
+    """
+    Fetch details.json from each skill subfolder within a user's skill folder.
+
+    S3 Structure:
+        Knowledge_Extraction_To_Skills/{folder_id}/skills/{skill_name}/details.json
+
+    Args:
+        folder_id: The user/enterprise folder ID (e.g., "chandler" or "akhil.parelly@company.com")
+
+    Returns:
+        List of skill details dictionaries, each containing the skill name and details.json content
+    """
+    skills_with_details = []
+
+    try:
+        # List all skill subfolders under the skills/ directory
+        skills_prefix = f"Knowledge_Extraction_To_Skills/{folder_id}/skills/"
+        logger.info(f"[SKILL_DETAILS] Listing skills at: s3://{SKILLS_BUCKET}/{skills_prefix}")
+
+        # List objects with delimiter to get "folders"
+        paginator = get_s3_client().get_paginator('list_objects_v2')
+        pages = paginator.paginate(
+            Bucket=SKILLS_BUCKET,
+            Prefix=skills_prefix,
+            Delimiter='/'
+        )
+
+        skill_folders = []
+        for page in pages:
+            for prefix in page.get('CommonPrefixes', []):
+                skill_folder_path = prefix['Prefix']
+                # Extract skill name from path (e.g., "close-store-end-of-day" from ".../skills/close-store-end-of-day/")
+                skill_name = skill_folder_path.rstrip('/').split('/')[-1]
+                if skill_name:
+                    skill_folders.append((skill_name, skill_folder_path))
+
+        logger.info(f"[SKILL_DETAILS] Found {len(skill_folders)} skill folders")
+
+        # Fetch details.json from each skill folder
+        for skill_name, skill_folder_path in skill_folders:
+            details_key = f"{skill_folder_path}details.json"
+
+            try:
+                logger.info(f"[SKILL_DETAILS] Fetching: s3://{SKILLS_BUCKET}/{details_key}")
+                response = get_s3_client().get_object(
+                    Bucket=SKILLS_BUCKET,
+                    Key=details_key
+                )
+                details_content = json.loads(response['Body'].read().decode('utf-8'))
+
+                skills_with_details.append({
+                    'skill_name': skill_name,
+                    'skill_path': skill_folder_path,
+                    'details': details_content
+                })
+                logger.info(f"[SKILL_DETAILS] Successfully loaded details for: {skill_name}")
+
+            except get_s3_client().exceptions.NoSuchKey:
+                logger.warning(f"[SKILL_DETAILS] No details.json found for skill: {skill_name}")
+                # Still include the skill, but without details
+                skills_with_details.append({
+                    'skill_name': skill_name,
+                    'skill_path': skill_folder_path,
+                    'details': None,
+                    '_note': 'details.json not found'
+                })
+            except Exception as e:
+                logger.warning(f"[SKILL_DETAILS] Error reading details for {skill_name}: {str(e)}")
+                skills_with_details.append({
+                    'skill_name': skill_name,
+                    'skill_path': skill_folder_path,
+                    'details': None,
+                    '_error': str(e)
+                })
+
+    except Exception as e:
+        logger.error(f"[SKILL_DETAILS] Error fetching skill details: {str(e)}", exc_info=True)
+        raise
+
+    return skills_with_details
+
+
 # Model configuration
 BEDROCK_MODEL = "global.anthropic.claude-sonnet-4-5-20250929-v1:0"
 MAX_TOKENS = 200000
@@ -2247,6 +2330,7 @@ Return ONLY valid JSON, no markdown or explanation."""
         │   ├── SKILL.md
         │   ├── config_schema.json
         │   ├── metadata.json
+        │   ├── details.json          <-- NEW: Comprehensive skill details for API
         │   ├── rules.yaml
         │   ├── definitions.yaml
         │   └── examples.yaml
@@ -2265,6 +2349,28 @@ Return ONLY valid JSON, no markdown or explanation."""
 
             logger.info(f"💾 [{i}/{len(skills)}] Saving: {skill_name}")
 
+            # Build details.json with comprehensive skill information
+            details_data = {
+                "name": skill_name,
+                "description": skill["metadata"].get("description", ""),
+                "version": skill["metadata"].get("version", "1.0.0"),
+                "category": skill["metadata"].get("category", "general"),
+                "tags": skill["metadata"].get("tags", []),
+                "author": skill["metadata"].get("author", ""),
+                "created_at": datetime.now().isoformat(),
+                "files": [
+                    "SKILL.md",
+                    "config_schema.json",
+                    "metadata.json",
+                    "rules.yaml",
+                    "definitions.yaml",
+                    "examples.yaml"
+                ],
+                "has_script": bool(skill.get("script_py")),
+                "script_name": self._to_snake_case(skill_name) + ".py" if skill.get("script_py") else None,
+                "metadata": skill["metadata"]
+            }
+
             # Save all skill files
             files_to_save = {
                 "SKILL.md": skill["skill_md"],
@@ -2272,7 +2378,8 @@ Return ONLY valid JSON, no markdown or explanation."""
                 "metadata.json": json.dumps(skill["metadata"], indent=2),
                 "rules.yaml": skill["rules_yaml"],
                 "definitions.yaml": skill["definitions_yaml"],
-                "examples.yaml": skill["examples_yaml"]
+                "examples.yaml": skill["examples_yaml"],
+                "details.json": json.dumps(details_data, indent=2)
             }
 
             for filename, content in files_to_save.items():
@@ -2671,6 +2778,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 if status_data:
                     # Add the path where we found it for debugging
                     status_data['_found_at_path'] = found_path
+
+                    # If status is completed, also fetch details.json from each skill subfolder
+                    if status_data.get('status') == 'completed':
+                        try:
+                            skills_with_details = fetch_skill_details(folder_id)
+                            if skills_with_details:
+                                status_data['skills_details'] = skills_with_details
+                                logger.info(f"[STATUS_CHECK] Added details for {len(skills_with_details)} skills")
+                        except Exception as details_err:
+                            logger.warning(f"[STATUS_CHECK] Could not fetch skill details: {str(details_err)}")
+
                     return {
                         'statusCode': 200,
                         'headers': CORS_HEADERS,
