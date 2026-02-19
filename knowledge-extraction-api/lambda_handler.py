@@ -2331,7 +2331,6 @@ Return ONLY valid JSON, no markdown or explanation."""
         │   ├── SKILL.md
         │   ├── config_schema.json
         │   ├── metadata.json
-        │   ├── details.json          <-- NEW: Comprehensive skill details for API
         │   ├── rules.yaml
         │   ├── definitions.yaml
         │   └── examples.yaml
@@ -2350,28 +2349,6 @@ Return ONLY valid JSON, no markdown or explanation."""
 
             logger.info(f"💾 [{i}/{len(skills)}] Saving: {skill_name}")
 
-            # Build details.json with comprehensive skill information
-            details_data = {
-                "name": skill_name,
-                "description": skill["metadata"].get("description", ""),
-                "version": skill["metadata"].get("version", "1.0.0"),
-                "category": skill["metadata"].get("category", "general"),
-                "tags": skill["metadata"].get("tags", []),
-                "author": skill["metadata"].get("author", ""),
-                "created_at": datetime.now().isoformat(),
-                "files": [
-                    "SKILL.md",
-                    "config_schema.json",
-                    "metadata.json",
-                    "rules.yaml",
-                    "definitions.yaml",
-                    "examples.yaml"
-                ],
-                "has_script": bool(skill.get("script_py")),
-                "script_name": self._to_snake_case(skill_name) + ".py" if skill.get("script_py") else None,
-                "metadata": skill["metadata"]
-            }
-
             # Save all skill files
             files_to_save = {
                 "SKILL.md": skill["skill_md"],
@@ -2379,8 +2356,7 @@ Return ONLY valid JSON, no markdown or explanation."""
                 "metadata.json": json.dumps(skill["metadata"], indent=2),
                 "rules.yaml": skill["rules_yaml"],
                 "definitions.yaml": skill["definitions_yaml"],
-                "examples.yaml": skill["examples_yaml"],
-                "details.json": json.dumps(details_data, indent=2)
+                "examples.yaml": skill["examples_yaml"]
             }
 
             for filename, content in files_to_save.items():
